@@ -874,10 +874,7 @@ def main():
                     last_backend_log_wall = wall_now
 
                 if (
-                    (armed_for_active or fresh_payload or (
-                        valid_emergency_event
-                        and emergency_vehicle_id not in seen_emergency_ids
-                    ))
+                    (armed_for_active or fresh_payload)
                     and not simulation_started
                     and (
                         (valid_counts and sum(counts.values()) > 0)
@@ -893,15 +890,7 @@ def main():
                     armed_for_active = False
                     stale_active_logged = False
                     waiting_logged = False
-                    trigger = (
-                        "ACTIVE response after WAITING"
-                        if state_changed and last_status == "ACTIVE"
-                        else (
-                            "new emergency ACTIVE event"
-                            if valid_emergency_event and emergency_vehicle_id not in seen_emergency_ids
-                            else "changed backend payload"
-                        )
-                    )
+                    trigger = "new/changed ACTIVE backend response"
                     print(
                         f"[SUMO] {trigger}; creating one finite batch of "
                         f"{sum(counts.values()) if valid_counts else 0} ordinary "
@@ -1025,10 +1014,16 @@ def main():
                             traci.trafficlight.setPhase(TLS_ID, 0)
                             print("[SUMO] preserved legacy emergency mapping: legacy_events phase 0")
                     elif mode == "EMERGENCY_VEHICLE_PRIORITY" and event_state == "ACTIVE":
-                        print(
-                            "[SUMO] emergency event fields accepted; priority is controlled "
-                            "by the event state machine"
-                        )
+                        if simulation_ready:
+                            print(
+                                "[SUMO] emergency event fields accepted; priority is controlled "
+                                "by the event state machine"
+                            )
+                        else:
+                            print(
+                                "[SUMO] cached emergency ACTIVE response observed; waiting for "
+                                "WAITING -> ACTIVE or a changed backend response before starting"
+                            )
                     elif "ACCIDENT" in mode:
                         if simulation_ready:
                             active_green_times = None
