@@ -19,6 +19,7 @@ INTERSECTION_ID = 1
 SIGNAL_CONTROL_URL = (
     f"{BACKEND_URL}/api/control/signal?intersection_id={INTERSECTION_ID}"
 )
+EMERGENCY_CLEAR_URL = f"{BACKEND_URL}/api/control/emergency/clear"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SUMO_CONFIG = str(PROJECT_DIR / "data" / "backend_demo.sumocfg")
@@ -158,6 +159,7 @@ def _load_network_phase_data():
 
 
 TLS_PHASE_STATES, TLS_PHASE_DURATIONS = _load_network_phase_data()
+TLS_STATE_PHASES = {state: phase for phase, state in TLS_PHASE_STATES.items()}
 EMERGENCY_EVENT_STATES = {"ACTIVE", "CLEARED"}
 EMERGENCY_VEHICLE_TYPE = "emergency_red"
 EMERGENCY_COLOR = (255, 0, 0, 255)
@@ -525,6 +527,49 @@ def _incoming_to_green_passes(previous_roads, current_roads):
     return passed
 
 
+def _tls_status_snapshot():
+    """Report phase labels from the active program, not a stale online phase index."""
+    program = traci.trafficlight.getProgram(TLS_ID)
+    raw_phase = traci.trafficlight.getPhase(TLS_ID)
+    signal_state = traci.trafficlight.getRedYellowGreenState(TLS_ID)
+    if program == "0":
+        phase_value = str(raw_phase)
+        phase_label = PHASE_LABELS.get(raw_phase, "unknown")
+        remaining = traci.trafficlight.getNextSwitch(TLS_ID) - traci.simulation.getTime()
+    else:
+        matching_phase = TLS_STATE_PHASES.get(signal_state)
+        if matching_phase is None:
+            phase_value = f"online/custom (reported phase {raw_phase})"
+            phase_label = "custom signal state"
+        else:
+            phase_value = f"online/state-match phase {matching_phase}"
+            phase_label = PHASE_LABELS.get(matching_phase, "unknown")
+        remaining = None
+    return program, phase_value, phase_label, signal_state, remaining
+
+
+def _post_emergency_clear(session, backend_vehicle_id):
+    try:
+        response = session.post(
+            EMERGENCY_CLEAR_URL,
+            params={"intersection_id": INTERSECTION_ID},
+            timeout=5,
+        )
+        response.raise_for_status()
+        print(
+            f"[backend] POST {EMERGENCY_CLEAR_URL}?intersection_id={INTERSECTION_ID} "
+            f"succeeded for emergency_vehicle_id={backend_vehicle_id} "
+            f"(HTTP {response.status_code})"
+        )
+        return True
+    except requests.RequestException as exc:
+        print(
+            f"[backend] emergency clear POST failed for "
+            f"emergency_vehicle_id={backend_vehicle_id}: {exc}"
+        )
+        return False
+
+
 def _ensure_emergency_vehicle_type():
     if EMERGENCY_VEHICLE_TYPE not in traci.vehicletype.getIDList():
         traci.vehicletype.copy("DEFAULT_VEHTYPE", EMERGENCY_VEHICLE_TYPE)
@@ -674,12 +719,13 @@ def _advance_emergency_controller(controller, sim_time, active_green_times):
 
 def _print_metrics(start_queues, passed, elapsed, comparison_label):
     queues = _queue_snapshot()
-    phase = traci.trafficlight.getPhase(TLS_ID)
-    remaining = traci.trafficlight.getNextSwitch(TLS_ID) - traci.simulation.getTime()
+    program, phase, phase_label, signal_state, remaining = _tls_status_snapshot()
+    remaining_text = (
+        f"{remaining:.1f}s" if remaining is not None else "held by TraCI online override"
+    )
     print(
-        f"[SUMO] signal phase {phase} ({PHASE_LABELS.get(phase, 'unknown')}), "
-        f"state={traci.trafficlight.getRedYellowGreenState(TLS_ID)}, "
-        f"remaining={remaining:.1f}s"
+        f"[SUMO] signal program={program}, phase={phase} ({phase_label}), "
+        f"state={signal_state}, remaining={remaining_text}"
     )
     print(f"[SUMO] {elapsed}s window ({comparison_label}) | queue start -> end, crossed stop line:")
     for direction in APPROACH_EDGES:
@@ -744,16 +790,19 @@ def main():
     active_emergency_sumo_id = None
     emergency_spawn_confirmed = False
     emergency_vehicle_finished = False
+    emergency_vehicle_arrived = False
+    emergency_clear_post_succeeded = False
+    emergency_clear_last_attempt = float("-inf")
+    emergency_early_cleared_logged = False
+    pending_restored_green_times = None
     current_backend_event_state = "WAITING"
     last_event_log_signature = None
-    last_tls_snapshot = (
-        traci.trafficlight.getPhase(TLS_ID),
-        traci.trafficlight.getRedYellowGreenState(TLS_ID),
-    )
+    last_tls_status = _tls_status_snapshot()
+    last_tls_snapshot = last_tls_status[:4]
     print(
         f"[SUMO] initial TLS state: event_state={current_backend_event_state}, "
-        f"phase={last_tls_snapshot[0]} ({PHASE_LABELS.get(last_tls_snapshot[0], 'unknown')}), "
-        f"state={last_tls_snapshot[1]}"
+        f"program={last_tls_status[0]}, phase={last_tls_status[1]} "
+        f"({last_tls_status[2]}), state={last_tls_status[3]}"
     )
     emergency_controller = {
         "state": "IDLE", "direction": None, "vehicle_id": None,
@@ -940,6 +989,11 @@ def main():
                             if active_emergency_sumo_id else False
                         )
                         emergency_vehicle_finished = False
+                        emergency_vehicle_arrived = False
+                        emergency_clear_post_succeeded = False
+                        emergency_clear_last_attempt = float("-inf")
+                        emergency_early_cleared_logged = False
+                        pending_restored_green_times = None
                         _begin_emergency_priority(
                             priority_direction, emergency_controller, sim_time
                         )
@@ -950,14 +1004,34 @@ def main():
                         )
                 elif event_state == "CLEARED":
                     restored_plan = snapshot.get("green_times")
-                    if restored_plan is not None and restored_plan != active_green_times:
-                        active_green_times = restored_plan
-                        print(
-                            "[SUMO] backend restored camera 1 green times:",
-                            json.dumps(restored_plan, ensure_ascii=False),
-                        )
-                    if emergency_controller["state"] not in ("IDLE", "CLEARING_TO_RESUME"):
-                        _begin_emergency_resume(emergency_controller, sim_time)
+                    if emergency_controller["state"] != "IDLE":
+                        if restored_plan is not None:
+                            pending_restored_green_times = restored_plan
+                        if not emergency_vehicle_arrived:
+                            if not emergency_early_cleared_logged:
+                                print(
+                                    "[SUMO] backend CLEARED ignored for now: emergency vehicle "
+                                    "has not reached its SUMO route destination"
+                                )
+                                emergency_early_cleared_logged = True
+                        elif not emergency_clear_post_succeeded:
+                            print(
+                                "[SUMO] backend CLEARED received after vehicle arrival, but "
+                                "clear POST has not succeeded; keeping priority signal"
+                            )
+                        else:
+                            restored_plan = (
+                                restored_plan or pending_restored_green_times
+                            )
+                            if restored_plan is not None:
+                                active_green_times = restored_plan
+                                print(
+                                    "[SUMO] backend CLEARED accepted; restored camera 1 "
+                                    "green times:",
+                                    json.dumps(restored_plan, ensure_ascii=False),
+                                )
+                            if emergency_controller["state"] != "CLEARING_TO_RESUME":
+                                _begin_emergency_resume(emergency_controller, sim_time)
 
                 signature = json.dumps(result, sort_keys=True, ensure_ascii=False)
                 result_changed = signature != last_result_signature
@@ -1169,6 +1243,12 @@ def main():
                     )
                     if arrived_id == active_emergency_sumo_id:
                         emergency_vehicle_finished = True
+                        emergency_vehicle_arrived = True
+                        print(
+                            f"[SUMO] emergency_vehicle_id="
+                            f"{emergency_controller['vehicle_id']} confirmed cleared "
+                            "the SUMO route; notifying backend"
+                        )
             if (
                 active_emergency_sumo_id
                 and emergency_spawn_confirmed
@@ -1181,17 +1261,30 @@ def main():
                     f"[SUMO] emergency vehicle disappeared before route arrival was reported "
                     f"at t={now:.1f}s: {active_emergency_sumo_id}"
                 )
-            current_tls_snapshot = (
-                traci.trafficlight.getPhase(TLS_ID),
-                traci.trafficlight.getRedYellowGreenState(TLS_ID),
-            )
+            if (
+                emergency_vehicle_arrived
+                and emergency_controller["state"] != "IDLE"
+                and not emergency_clear_post_succeeded
+                and now - emergency_clear_last_attempt >= 5
+            ):
+                emergency_clear_last_attempt = now
+                emergency_clear_post_succeeded = _post_emergency_clear(
+                    session, emergency_controller["vehicle_id"]
+                )
+
+            current_tls_status = _tls_status_snapshot()
+            current_tls_snapshot = current_tls_status[:4]
             if current_tls_snapshot != last_tls_snapshot:
-                phase, signal_state = current_tls_snapshot
+                program, phase, phase_label, signal_state, remaining = current_tls_status
+                remaining_text = (
+                    f"{remaining:.1f}s"
+                    if remaining is not None else "held by TraCI online override"
+                )
                 print(
                     f"[SUMO] TLS changed at t={now:.1f}s; "
                     f"event_state={current_backend_event_state}; "
-                    f"phase={phase} ({PHASE_LABELS.get(phase, 'online/custom')}), "
-                    f"state={signal_state}"
+                    f"program={program}, phase={phase} ({phase_label}), "
+                    f"state={signal_state}, remaining={remaining_text}"
                 )
                 last_tls_snapshot = current_tls_snapshot
             if now - window_start_time >= METRICS_INTERVAL:
