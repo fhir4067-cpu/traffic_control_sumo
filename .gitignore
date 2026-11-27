@@ -4,3 +4,4 @@ __pycache__/
 *.backup*
 tripinfo.xml
 data/*.out
+data/comparison_results/

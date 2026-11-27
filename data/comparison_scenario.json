@@ -1,0 +1,13 @@
+{
+  "duration_seconds": 180,
+  "warmup_seconds": 20,
+  "seed": 42,
+  "spawn_window_seconds": 30,
+  "initial_queue": {
+    "direction": "east",
+    "vehicles_per_lane": 8,
+    "front_gap_m": 12.0,
+    "spacing_m": 12.0
+  },
+  "emergency": null
+}
